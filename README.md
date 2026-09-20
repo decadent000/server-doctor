@@ -1,29 +1,30 @@
 # Server Doctor
 
-一个面向 Java 生产环境的轻量级诊断工具，目标是自动采集服务器与 JVM 信息、识别常见风险，并生成 HTML 诊断报告。
+面向 Java 生产环境的轻量级诊断工具。V0.2 重点增加多次线程栈分析、JVM Heap/GC 指标和可配置报告目录。
 
 ## 当前版本
 
-V0.1
+**V0.2.0 / JDK 8+**
 
-已支持：
+### 已支持
 
-- CPU 使用率采集
-- 内存使用率采集
-- 磁盘使用率采集
-- Java 进程发现
-- 自动排除 Server Doctor 自身 Java 进程
-- 支持通过 `--pid` 指定需要诊断的 JVM
-- Java 进程 CPU / 内存 / 启动命令采集
-- 排除自身后仅有一个 Java 进程时自动执行 jstack
-- 多 Java 进程时不自动误选目标
-- CPU / 内存 / 磁盘基础规则诊断
-- HTML 诊断报告生成
+- 系统 CPU、内存、磁盘采集
+- Java 进程发现与自身 PID 自动排除
+- `--pid` 指定目标 JVM
+- `--output` 指定报告输出根目录
+- `SERVER_DOCTOR_OUTPUT` 环境变量配置输出目录
+- 每次运行自动创建独立时间戳诊断目录
+- 默认连续采集 3 次 jstack
+- `--samples` 调整采样次数
+- `--interval` 调整采样间隔
+- RUNNABLE / BLOCKED / WAITING / TIMED_WAITING 线程统计
+- 相同调用栈聚合
+- 持续 RUNNABLE 热点候选识别
+- Java 级死锁检测
+- 通过 `jstat -gc` 采集 Heap / Metaspace / Young GC / Full GC 指标
+- 增强 HTML 诊断报告
 
-## 环境要求
-
-- JDK 8+
-- Maven 3.6+
+> “持续 RUNNABLE 热点候选”来自多次 jstack 的稳定状态与调用栈，不等同于真实 CPU profiling。CPU 问题仍建议结合 `top -H`、`pidstat` 或 async-profiler 进一步确认。
 
 ## 编译
 
@@ -34,107 +35,149 @@ mvn clean package
 生成：
 
 ```text
-target/server-doctor-0.1.0.jar
+target/server-doctor-0.2.0.jar
 ```
 
-## 运行
+## 推荐运行方式
 
-### 自动模式
-
-```bash
-java -jar target/server-doctor-0.1.0.jar
-```
-
-Server Doctor 会自动排除自己的 Java 进程。如果排除自身后恰好只剩一个 Java 进程，会自动选择该进程执行 jstack。
-
-### 指定 Java 进程
-
-推荐生产环境显式指定目标 PID：
-
-```bash
-java -jar target/server-doctor-0.1.0.jar --pid 1
-```
-
-也支持：
-
-```bash
-java -jar target/server-doctor-0.1.0.jar --pid=1
-```
-
-查看帮助：
-
-```bash
-java -jar target/server-doctor-0.1.0.jar --help
-```
-
-如果服务器或容器中存在多个 Java 进程且未指定 `--pid`，Server Doctor 只列出进程，不会自动执行 jstack，以避免误诊断。
-
-运行后会在当前目录生成：
+你的 moc-ohtc 容器中业务 JVM 为 PID 1，宿主机日志目录：
 
 ```text
-jstack.txt
-server-doctor-report.html
+/u01/soft/logs -> /u01/soft/logs
 ```
 
-其中 `jstack.txt` 仅在成功选择目标 Java 进程并执行 jstack 后生成。
-
-## Docker 使用示例
-
-假设业务 Java 程序在容器内 PID 为 1：
+所以推荐直接：
 
 ```bash
-docker cp target/server-doctor-0.1.0.jar <container-id>:/tmp/server-doctor.jar
-docker exec -it <container-id> sh
-cd /tmp
-java -jar server-doctor.jar --pid 1
+java -Xms32m -Xmx128m \
+  -jar /tmp/server-doctor.jar \
+  --pid 1 \
+  --output /u01/soft/logs/moc-temp
 ```
 
-Server Doctor 自身启动后也会成为一个 Java 进程，但会自动识别并排除自身 PID。
-
-## 项目结构
+程序会自动创建类似：
 
 ```text
-server-doctor/
-├── pom.xml
-└── src/main/java/com/serverdoctor/
-    ├── ServerDoctorApplication.java
-    ├── analyzer/
-    │   └── DiagnosticAnalyzer.java
-    ├── collector/
-    │   ├── JavaProcessCollector.java
-    │   ├── SystemCollector.java
-    │   └── ThreadDumpCollector.java
-    ├── model/
-    │   └── DiagnosticResult.java
-    └── report/
-        └── HtmlReportGenerator.java
+/u01/soft/logs/moc-temp/
+└── server-doctor-20260920-114500-pid1/
+    ├── jstack-1.txt
+    ├── jstack-2.txt
+    ├── jstack-3.txt
+    ├── jstack.txt
+    └── server-doctor-report.html
 ```
 
-## 后续计划
+因为 `/u01/soft/logs` 已映射到宿主机，所以文件管理器可以直接看到这些文件，无需再执行 `docker cp`。
 
-V0.2 计划增加：
+## 参数
 
-- 连续多次 jstack 采样
-- RUNNABLE / BLOCKED 线程统计
+```text
+--pid <PID>
+    指定目标Java进程。
+
+--output <目录>
+    指定输出根目录。
+    未指定时依次使用：
+    1. SERVER_DOCTOR_OUTPUT 环境变量
+    2. 当前工作目录
+
+--samples <1-10>
+    jstack采样次数，默认3。
+
+--interval <1-60>
+    两次jstack之间的间隔秒数，默认5。
+
+--help
+    查看帮助。
+```
+
+例如：
+
+```bash
+java -jar server-doctor-0.2.0.jar \
+  --pid 1 \
+  --output /u01/soft/logs/moc-temp \
+  --samples 3 \
+  --interval 5
+```
+
+## Docker 使用
+
+宿主机：
+
+```bash
+docker cp target/server-doctor-0.2.0.jar moc-ohtc:/tmp/server-doctor.jar
+docker exec -it moc-ohtc bash
+```
+
+容器内：
+
+```bash
+java -Xms32m -Xmx128m \
+  -jar /tmp/server-doctor.jar \
+  --pid 1 \
+  --output /u01/soft/logs/moc-temp
+```
+
+## V0.2 线程分析逻辑
+
+默认流程：
+
+```text
+系统资源
+   ↓
+目标JVM
+   ↓
+jstat -gc
+   ↓
+jstack #1
+   ↓ 5秒
+jstack #2
+   ↓ 5秒
+jstack #3
+   ↓
+线程状态统计
+   ↓
+相同调用栈聚合
+   ↓
+持续RUNNABLE候选
+   ↓
+死锁检测
+   ↓
+HTML报告
+```
+
+持续 RUNNABLE 候选会过滤常见的空闲等待调用，例如 `Unsafe.park`、`Object.wait`、`epollWait`、socket read/accept 等，以减少明显误报。
+
+## 输出报告包含
+
+- 系统 CPU / Memory / Disk
+- 目标 Java 进程
+- Heap 使用量与使用率
+- Metaspace
+- Young GC 次数与累计耗时
+- Full GC 次数与累计耗时
+- 每次 jstack 的线程状态统计
+- 持续 RUNNABLE 热点候选
 - 相同调用栈聚合
-- 持续热点线程识别
-- Java 死锁检测
-- JVM Heap / GC 指标采集
-- 更完整的 HTML 线程分析报告
-
-后续版本计划扩展：
-
-- Docker 诊断
-- Redis 诊断
-- MySQL / Oracle 诊断
-- 日志分析
-- AI 辅助根因分析
-- 脱敏后的诊断报告导出
+- Java 级死锁结果
+- CPU / 内存 / 磁盘 / Heap / 线程规则诊断
 
 ## 注意
 
-jstack 必须存在于运行 Server Doctor 的 JDK 中，并且当前用户需要有权限 attach 到目标 Java 进程。
+- 运行用户必须有权限 attach 到目标 JVM。
+- 容器中需要有 `jstack`；Heap/GC 采集还需要 `jstat`。
+- 多次 jstack 会产生一定诊断开销，生产环境建议先在测试环境验证；高负载情况下可使用较大的 `--interval`。
+- 当前 V0.2 不把“持续 RUNNABLE”直接判定为 CPU 热点，只标记为候选。
+- 如果存在多个 Java 进程，建议始终显式指定 `--pid`。
 
-在 Docker / Kubernetes 环境中，建议直接在目标 Java 容器内运行，或者确保 Server Doctor 与目标 JVM 处于可互相访问的 PID namespace 中。
+## 后续方向
 
-生产环境使用前建议先在测试环境验证。
+- Docker 容器指标
+- Redis 诊断
+- MySQL / Oracle 诊断
+- GC 日志趋势分析
+- Heap Dump 辅助分析
+- 日志异常聚类
+- AI 辅助根因分析
+- Web / Agent 模式

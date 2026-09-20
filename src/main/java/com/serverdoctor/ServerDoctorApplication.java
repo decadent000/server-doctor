@@ -1,31 +1,39 @@
 package com.serverdoctor;
 
 import com.serverdoctor.analyzer.DiagnosticAnalyzer;
+import com.serverdoctor.analyzer.ThreadDumpAnalyzer;
 import com.serverdoctor.collector.JavaProcessCollector;
+import com.serverdoctor.collector.JvmMetricsCollector;
 import com.serverdoctor.collector.SystemCollector;
 import com.serverdoctor.collector.ThreadDumpCollector;
+import com.serverdoctor.config.RunConfig;
 import com.serverdoctor.model.DiagnosticResult;
+import com.serverdoctor.model.JvmMetrics;
+import com.serverdoctor.model.ThreadAnalysis;
 import com.serverdoctor.report.HtmlReportGenerator;
+import com.serverdoctor.util.OutputDirectoryManager;
 
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
+import java.util.ArrayList;
 import java.util.List;
 
 public class ServerDoctorApplication {
 
     public static void main(String[] args) throws Exception {
-        if (containsHelp(args)) {
+        RunConfig config;
+
+        try {
+            config = RunConfig.parse(args);
+        } catch (IllegalArgumentException e) {
+            System.err.println("参数错误：" + e.getMessage());
             printUsage();
             return;
         }
 
-        Integer requestedPid;
-        try {
-            requestedPid = parseRequestedPid(args);
-        } catch (IllegalArgumentException e) {
-            System.err.println("参数错误：" + e.getMessage());
+        if (config.isHelp()) {
             printUsage();
             return;
         }
@@ -74,28 +82,108 @@ public class ServerDoctorApplication {
             printJavaProcess(process);
         }
 
+        JavaProcessCollector.JavaProcessInfo target =
+                selectTargetProcess(javaProcesses, config.getPid(), selfPid);
+
+        File runDir = OutputDirectoryManager.createRunDirectory(
+                config.getOutputRoot(),
+                target == null ? null : target.getPid()
+        );
+
+        System.out.println();
+        System.out.println("本次诊断目录：" + runDir.getAbsolutePath());
+
         DiagnosticAnalyzer analyzer = new DiagnosticAnalyzer();
         List<DiagnosticResult> results =
-                analyzer.analyzeSystem(cpu, memory, disks);
+                new ArrayList<DiagnosticResult>(analyzer.analyzeSystem(cpu, memory, disks));
 
-        JavaProcessCollector.JavaProcessInfo target =
-                selectTargetProcess(javaProcesses, requestedPid, selfPid);
+        JvmMetrics jvmMetrics = null;
+        ThreadAnalysis threadAnalysis = null;
 
         if (target != null) {
             System.out.println();
             System.out.println("诊断目标：PID=" + target.getPid());
-            collectThreadDump(target);
+
+            jvmMetrics = new JvmMetricsCollector().collect(target.getPid());
+            printJvmMetrics(jvmMetrics);
+            results.addAll(analyzer.analyzeJvm(jvmMetrics));
+
+            List<String> dumps = collectThreadDumps(
+                    target,
+                    runDir,
+                    config.getSamples(),
+                    config.getIntervalSeconds()
+            );
+
+            threadAnalysis = new ThreadDumpAnalyzer().analyze(dumps);
+            results.addAll(analyzer.analyzeThreads(threadAnalysis));
+
+            printThreadSummary(threadAnalysis);
         }
 
         HtmlReportGenerator generator = new HtmlReportGenerator();
-        File report = generator.generate(results);
+        File report = generator.generate(
+                runDir,
+                results,
+                cpu,
+                memory,
+                disks,
+                target,
+                jvmMetrics,
+                threadAnalysis,
+                config.getIntervalSeconds()
+        );
 
         System.out.println();
         System.out.println("================================");
         System.out.println("诊断完成");
-        System.out.println("发现系统异常：" + results.size());
-        System.out.println("报告：" + report.getAbsolutePath());
+        System.out.println("发现异常/关注项：" + results.size());
+        System.out.println("诊断目录：" + runDir.getAbsolutePath());
+        System.out.println("HTML报告：" + report.getAbsolutePath());
         System.out.println("================================");
+    }
+
+    private static List<String> collectThreadDumps(
+            JavaProcessCollector.JavaProcessInfo process,
+            File runDir,
+            int samples,
+            int intervalSeconds) throws IOException, InterruptedException {
+
+        List<String> dumps = new ArrayList<String>();
+        ThreadDumpCollector collector = new ThreadDumpCollector();
+
+        for (int i = 1; i <= samples; i++) {
+            System.out.println();
+            System.out.println("正在采集线程栈 " + i + "/" + samples + "，PID=" + process.getPid());
+
+            String dump = collector.collect(process.getPid());
+            dumps.add(dump);
+
+            File sampleFile = new File(runDir, "jstack-" + i + ".txt");
+            writeText(sampleFile, dump);
+            System.out.println("已保存：" + sampleFile.getAbsolutePath());
+
+            if (i < samples) {
+                System.out.println("等待 " + intervalSeconds + " 秒后进行下一次采样...");
+                Thread.sleep(intervalSeconds * 1000L);
+            }
+        }
+
+        if (!dumps.isEmpty()) {
+            File compatibilityFile = new File(runDir, "jstack.txt");
+            writeText(compatibilityFile, dumps.get(dumps.size() - 1));
+        }
+
+        return dumps;
+    }
+
+    private static void writeText(File file, String text) throws IOException {
+        FileWriter writer = new FileWriter(file);
+        try {
+            writer.write(text == null ? "" : text);
+        } finally {
+            writer.close();
+        }
     }
 
     private static JavaProcessCollector.JavaProcessInfo selectTargetProcess(
@@ -104,11 +192,6 @@ public class ServerDoctorApplication {
             int selfPid) {
 
         if (requestedPid != null) {
-            if (requestedPid <= 0) {
-                System.err.println("PID必须大于0。");
-                return null;
-            }
-
             if (selfPid > 0 && requestedPid == selfPid) {
                 System.err.println("不能诊断Server Doctor自身进程 PID=" + selfPid);
                 return null;
@@ -135,7 +218,7 @@ public class ServerDoctorApplication {
         if (javaProcesses.size() > 1) {
             System.out.println();
             System.out.println("检测到多个Java进程，为避免误诊断，不自动执行jstack。");
-            System.out.println("请使用：java -jar server-doctor-0.1.0.jar --pid <PID>");
+            System.out.println("请使用：java -jar server-doctor-0.2.0.jar --pid <PID>");
         }
 
         return null;
@@ -150,73 +233,52 @@ public class ServerDoctorApplication {
         System.out.println("Command: " + safe(process.getCommandLine()));
     }
 
-    private static void collectThreadDump(JavaProcessCollector.JavaProcessInfo process)
-            throws IOException {
-
+    private static void printJvmMetrics(JvmMetrics metrics) {
         System.out.println();
-        System.out.println("正在采集线程栈 PID=" + process.getPid());
+        System.out.println("正在采集JVM Heap / GC指标...");
 
-        ThreadDumpCollector collector = new ThreadDumpCollector();
-        String dump = collector.collect(process.getPid());
-
-        File dumpFile = new File("jstack.txt");
-        FileWriter writer = new FileWriter(dumpFile);
-
-        try {
-            writer.write(dump);
-        } finally {
-            writer.close();
+        if (metrics == null || !metrics.isAvailable()) {
+            System.out.println("JVM指标不可用：" +
+                    (metrics == null ? "无数据" : metrics.getMessage()));
+            return;
         }
 
-        System.out.println("线程栈已保存：" + dumpFile.getAbsolutePath());
+        System.out.printf(
+                "Heap: %.2f MB / %.2f MB (%.2f%%)%n",
+                metrics.getHeapUsedKb() / 1024D,
+                metrics.getHeapCapacityKb() / 1024D,
+                metrics.getHeapUsagePercent()
+        );
+
+        System.out.println(
+                "Young GC: " + metrics.getYoungGcCount() +
+                        " 次，耗时 " + metrics.getYoungGcTimeSeconds() + " 秒"
+        );
+
+        System.out.println(
+                "Full GC: " + metrics.getFullGcCount() +
+                        " 次，耗时 " + metrics.getFullGcTimeSeconds() + " 秒"
+        );
     }
 
-    private static Integer parseRequestedPid(String[] args) {
-        Integer pid = null;
+    private static void printThreadSummary(ThreadAnalysis analysis) {
+        System.out.println();
+        System.out.println("线程分析完成：");
 
-        for (int i = 0; i < args.length; i++) {
-            String arg = args[i];
-
-            if ("--pid".equals(arg)) {
-                if (i + 1 >= args.length) {
-                    throw new IllegalArgumentException("--pid 后必须跟进程号");
-                }
-                if (pid != null) {
-                    throw new IllegalArgumentException("--pid 不能重复指定");
-                }
-                pid = parsePidValue(args[++i]);
-            } else if (arg.startsWith("--pid=")) {
-                if (pid != null) {
-                    throw new IllegalArgumentException("--pid 不能重复指定");
-                }
-                pid = parsePidValue(arg.substring("--pid=".length()));
-            } else if (!"-h".equals(arg) && !"--help".equals(arg)) {
-                throw new IllegalArgumentException("未知参数：" + arg);
-            }
+        ThreadAnalysis.SampleSummary last = analysis.getLastSampleSummary();
+        if (last != null) {
+            System.out.println("最后一次采样线程总数：" + last.getTotalThreads());
+            System.out.println("RUNNABLE：" + last.getStateCount("RUNNABLE"));
+            System.out.println("BLOCKED：" + last.getStateCount("BLOCKED"));
+            System.out.println("WAITING：" + last.getStateCount("WAITING"));
+            System.out.println("TIMED_WAITING：" + last.getStateCount("TIMED_WAITING"));
         }
 
-        return pid;
-    }
+        System.out.println("持续RUNNABLE热点候选：" +
+                analysis.getPersistentRunnableThreads().size());
 
-    private static int parsePidValue(String value) {
-        try {
-            int pid = Integer.parseInt(value);
-            if (pid <= 0) {
-                throw new IllegalArgumentException("PID必须大于0");
-            }
-            return pid;
-        } catch (NumberFormatException e) {
-            throw new IllegalArgumentException("无效PID：" + value);
-        }
-    }
-
-    private static boolean containsHelp(String[] args) {
-        for (String arg : args) {
-            if ("-h".equals(arg) || "--help".equals(arg)) {
-                return true;
-            }
-        }
-        return false;
+        System.out.println("死锁：" +
+                (analysis.isDeadlockDetected() ? "检测到" : "未发现"));
     }
 
     private static int getCurrentPid() {
@@ -244,22 +306,26 @@ public class ServerDoctorApplication {
 
     private static void printBanner() {
         System.out.println("================================");
-        System.out.println("       Server Doctor V0.1");
+        System.out.println("       Server Doctor V0.2");
         System.out.println("================================");
     }
 
     private static void printUsage() {
-        System.out.println("Server Doctor V0.1");
+        System.out.println("Server Doctor V0.2");
         System.out.println();
         System.out.println("用法：");
-        System.out.println("  java -jar server-doctor-0.1.0.jar");
-        System.out.println("  java -jar server-doctor-0.1.0.jar --pid 1");
-        System.out.println("  java -jar server-doctor-0.1.0.jar --pid=1");
+        System.out.println("  java -jar server-doctor-0.2.0.jar --pid 1");
+        System.out.println("  java -jar server-doctor-0.2.0.jar --pid 1 --output /u01/soft/logs/moc-temp");
+        System.out.println("  java -jar server-doctor-0.2.0.jar --pid 1 --samples 3 --interval 5");
         System.out.println();
-        System.out.println("规则：");
-        System.out.println("  1. 自动排除Server Doctor自身Java进程；");
-        System.out.println("  2. 未指定--pid且仅剩一个Java进程时，自动选择；");
-        System.out.println("  3. 未指定--pid且存在多个Java进程时，不自动执行jstack；");
-        System.out.println("  4. 多Java进程环境建议显式使用--pid指定目标。");
+        System.out.println("参数：");
+        System.out.println("  --pid       指定目标Java进程PID");
+        System.out.println("  --output    输出根目录；也可使用环境变量SERVER_DOCTOR_OUTPUT");
+        System.out.println("  --samples   jstack采样次数，默认3，范围1-10");
+        System.out.println("  --interval  jstack采样间隔秒数，默认5，范围1-60");
+        System.out.println("  --help      显示帮助");
+        System.out.println();
+        System.out.println("输出：");
+        System.out.println("  每次诊断会在output目录下创建独立的server-doctor-时间-pid目录。");
     }
 }
