@@ -1,7 +1,9 @@
 package com.serverdoctor.analyzer;
 
+import com.serverdoctor.collector.JavaProcessCollector;
 import com.serverdoctor.collector.SystemCollector;
 import com.serverdoctor.model.DiagnosticResult;
+import com.serverdoctor.model.JvmFlags;
 import com.serverdoctor.model.JvmMetrics;
 import com.serverdoctor.model.ThreadAnalysis;
 
@@ -24,21 +26,28 @@ public class DiagnosticAnalyzer {
         return results;
     }
 
-    public List<DiagnosticResult> analyzeJvm(JvmMetrics metrics) {
+    public List<DiagnosticResult> analyzeJvm(JvmMetrics metrics, JvmFlags flags) {
         List<DiagnosticResult> results = new ArrayList<DiagnosticResult>();
 
         if (metrics == null || !metrics.isAvailable()) {
             return results;
         }
 
-        double heapUsage = metrics.getHeapUsagePercent();
+        double heapUsage = -1D;
+
+        if (flags != null && flags.isAvailable() && flags.getMaxHeapSizeBytes() > 0) {
+            heapUsage = metrics.getHeapUsedKb() * 1024D
+                    / flags.getMaxHeapSizeBytes() * 100D;
+        } else if (metrics.getHeapCapacityKb() > 0) {
+            heapUsage = metrics.getHeapUsagePercent();
+        }
 
         if (heapUsage >= 95D) {
             results.add(new DiagnosticResult(
                     "HIGH",
                     "JVM",
                     "JVM Heap使用率严重偏高",
-                    String.format("当前Heap使用率 %.2f%%", heapUsage),
+                    String.format("当前Heap约占实际最大Heap %.2f%%", heapUsage),
                     "建议结合GC日志、Full GC次数、对象分配速度和Heap Dump继续分析。"
             ));
         } else if (heapUsage >= 85D) {
@@ -46,8 +55,49 @@ public class DiagnosticAnalyzer {
                     "WARN",
                     "JVM",
                     "JVM Heap使用率偏高",
-                    String.format("当前Heap使用率 %.2f%%", heapUsage),
+                    String.format("当前Heap约占实际最大Heap %.2f%%", heapUsage),
                     "建议持续观察Heap与GC趋势，确认是否存在持续增长。"
+            ));
+        }
+
+        return results;
+    }
+
+    public List<DiagnosticResult> analyzeJvmCommandLine(
+            JavaProcessCollector.JavaProcessInfo target,
+            JvmFlags flags) {
+
+        List<DiagnosticResult> results = new ArrayList<DiagnosticResult>();
+
+        if (target == null || target.getCommandLine() == null) {
+            return results;
+        }
+
+        List<String> misplaced = findJvmOptionsAfterJar(target.getCommandLine());
+
+        if (!misplaced.isEmpty()) {
+            results.add(new DiagnosticResult(
+                    "WARN",
+                    "JVM_CONFIG",
+                    "发现疑似放在应用参数区的JVM参数",
+                    "这些参数位于目标jar之后，通常不会作为JVM参数生效：" + misplaced,
+                    "请把-Xms/-Xmx/-XX/-D/-agentlib/-javaagent等JVM参数移动到-jar之前，并在重启后用jcmd <pid> VM.flags确认实际生效值。"
+            ));
+        }
+
+        if (flags != null && flags.isAvailable()
+                && flags.getMaxHeapSizeBytes() > 0
+                && target.getCommandLine().contains("-Xmx")
+                && (flags.getEffectiveJvmArgs() == null
+                    || !flags.getEffectiveJvmArgs().contains("-Xmx"))) {
+
+            results.add(new DiagnosticResult(
+                    "WARN",
+                    "JVM_CONFIG",
+                    "命令行存在-Xmx，但JVM有效参数中未发现-Xmx",
+                    "实际MaxHeapSize=" + formatMb(flags.getMaxHeapSizeBytes())
+                            + " MB；JVM有效参数=" + safe(flags.getEffectiveJvmArgs()),
+                    "这通常说明-Xmx位置错误或启动脚本未按预期传递。建议检查Docker CMD/ENTRYPOINT和启动脚本参数顺序。"
             ));
         }
 
@@ -91,9 +141,9 @@ public class DiagnosticAnalyzer {
             results.add(new DiagnosticResult(
                     "WARN",
                     "THREAD",
-                    "发现持续RUNNABLE热点候选",
+                    "发现持续RUNNABLE计算候选",
                     detail.toString(),
-                    "该结论来自多次jstack持续RUNNABLE与稳定调用栈，不等同于CPU采样；建议结合top -H、pidstat或async-profiler进一步确认。"
+                    "已过滤常见park/socket/epoll/accept等等待栈；仍建议结合真实线程CPU采样确认。"
             ));
         }
 
@@ -109,9 +159,73 @@ public class DiagnosticAnalyzer {
                         "建议检查锁竞争、synchronized临界区、数据库/Redis调用外围锁以及线程池任务堆积。"
                 ));
             }
+
+            if (last.getTotalThreads() >= 1000) {
+                results.add(new DiagnosticResult(
+                        "WARN",
+                        "THREAD",
+                        "Java线程总数较高",
+                        "最后一次采样线程总数=" + last.getTotalThreads(),
+                        "线程多不等于异常，但会增加线程栈内存和调度成本。建议确认连接线程、PCB线程、线程池上限和是否存在持续创建未回收的线程。"
+                ));
+            }
         }
 
         return results;
+    }
+
+    private List<String> findJvmOptionsAfterJar(String commandLine) {
+        List<String> result = new ArrayList<String>();
+        String[] tokens = commandLine.trim().split("\\s+");
+
+        int jarIndex = -1;
+        for (int i = 0; i < tokens.length; i++) {
+            String token = stripQuotes(tokens[i]);
+            if (token.endsWith(".jar")) {
+                jarIndex = i;
+                break;
+            }
+        }
+
+        if (jarIndex < 0) {
+            return result;
+        }
+
+        for (int i = jarIndex + 1; i < tokens.length; i++) {
+            String token = stripQuotes(tokens[i]);
+
+            if (token.startsWith("-Xms")
+                    || token.startsWith("-Xmx")
+                    || token.startsWith("-XX:")
+                    || token.startsWith("-D")
+                    || token.startsWith("-agentlib:")
+                    || token.startsWith("-javaagent:")) {
+                result.add(token);
+            }
+        }
+
+        return result;
+    }
+
+    private String stripQuotes(String value) {
+        if (value == null || value.length() < 2) {
+            return value;
+        }
+
+        if ((value.startsWith("\"") && value.endsWith("\""))
+                || (value.startsWith("'") && value.endsWith("'"))) {
+            return value.substring(1, value.length() - 1);
+        }
+
+        return value;
+    }
+
+    private String safe(String value) {
+        return value == null || value.trim().isEmpty() ? "(empty)" : value;
+    }
+
+    private String formatMb(long bytes) {
+        return String.format("%.2f", bytes / 1024D / 1024D);
     }
 
     private void analyzeCpu(double cpu, List<DiagnosticResult> results) {

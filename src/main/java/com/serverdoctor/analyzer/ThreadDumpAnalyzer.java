@@ -232,10 +232,13 @@ public class ThreadDumpAnalyzer {
                 continue;
             }
 
+            String topFrame = normalizeFrame(accumulator.thread.getFrames().get(0));
+
             result.add(new ThreadAnalysis.StackGroup(
                     accumulator.thread.getState(),
+                    classify(accumulator.thread.getState(), topFrame),
                     accumulator.count,
-                    normalizeFrame(accumulator.thread.getFrames().get(0)),
+                    topFrame,
                     limitFrames(accumulator.thread.getFrames(), 10)
             ));
         }
@@ -252,6 +255,23 @@ public class ThreadDumpAnalyzer {
         }
 
         return result;
+    }
+
+    private String classify(String state, String topFrame) {
+        if (isIoWaitFrame(topFrame)) {
+            return "IO_WAIT";
+        }
+
+        if ("WAITING".equals(state) || "TIMED_WAITING".equals(state)
+                || isParkWaitFrame(topFrame)) {
+            return "WAITING";
+        }
+
+        if ("RUNNABLE".equals(state)) {
+            return "COMPUTE_CANDIDATE";
+        }
+
+        return "OTHER";
     }
 
     private String stackSignature(List<String> frames, int limit) {
@@ -275,17 +295,29 @@ public class ThreadDumpAnalyzer {
     }
 
     private boolean isKnownIdleFrame(String frame) {
+        return isParkWaitFrame(frame) || isIoWaitFrame(frame);
+    }
+
+    private boolean isParkWaitFrame(String frame) {
         return frame.contains("sun.misc.Unsafe.park")
                 || frame.contains("jdk.internal.misc.Unsafe.park")
                 || frame.contains("java.lang.Object.wait")
                 || frame.contains("java.lang.Thread.sleep")
-                || frame.contains("java.lang.ref.Reference.waitForReferencePendingList")
-                || frame.contains("sun.nio.ch.EPollArrayWrapper.epollWait")
+                || frame.contains("java.lang.ref.Reference.waitForReferencePendingList");
+    }
+
+    private boolean isIoWaitFrame(String frame) {
+        return frame.contains("sun.nio.ch.EPollArrayWrapper.epollWait")
                 || frame.contains("sun.nio.ch.EPoll.wait")
                 || frame.contains("sun.nio.ch.KQueueArrayWrapper.kevent0")
                 || frame.contains("sun.nio.ch.KQueue.poll")
                 || frame.contains("java.net.PlainSocketImpl.socketAccept")
                 || frame.contains("java.net.SocketInputStream.socketRead0")
+                || frame.contains("sun.nio.ch.ServerSocketChannelImpl.accept0")
+                || frame.contains("sun.nio.ch.ServerSocketChannelImpl.accept")
+                || frame.contains("sun.nio.ch.SocketDispatcher.read0")
+                || frame.contains("sun.nio.ch.FileDispatcherImpl.read0")
+                || frame.contains("sun.nio.ch.DatagramChannelImpl.receive0")
                 || frame.contains("sun.nio.ch.WindowsSelectorImpl$SubSelector.poll0")
                 || frame.contains("io.netty.channel.epoll.Native.epollWait")
                 || frame.contains("io.netty.channel.kqueue.Native.keventWait");

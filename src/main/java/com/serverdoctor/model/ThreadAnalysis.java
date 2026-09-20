@@ -141,12 +141,18 @@ public class ThreadAnalysis {
     public static class StackGroup {
 
         private final String state;
+        private final String category;
         private final int count;
         private final String topFrame;
         private final List<String> stack;
 
-        public StackGroup(String state, int count, String topFrame, List<String> stack) {
+        public StackGroup(String state,
+                          String category,
+                          int count,
+                          String topFrame,
+                          List<String> stack) {
             this.state = state;
+            this.category = category;
             this.count = count;
             this.topFrame = topFrame;
             this.stack = Collections.unmodifiableList(new ArrayList<String>(stack));
@@ -154,6 +160,10 @@ public class ThreadAnalysis {
 
         public String getState() {
             return state;
+        }
+
+        public String getCategory() {
+            return category;
         }
 
         public int getCount() {

@@ -3,11 +3,13 @@ package com.serverdoctor;
 import com.serverdoctor.analyzer.DiagnosticAnalyzer;
 import com.serverdoctor.analyzer.ThreadDumpAnalyzer;
 import com.serverdoctor.collector.JavaProcessCollector;
+import com.serverdoctor.collector.JvmFlagsCollector;
 import com.serverdoctor.collector.JvmMetricsCollector;
 import com.serverdoctor.collector.SystemCollector;
 import com.serverdoctor.collector.ThreadDumpCollector;
 import com.serverdoctor.config.RunConfig;
 import com.serverdoctor.model.DiagnosticResult;
+import com.serverdoctor.model.JvmFlags;
 import com.serverdoctor.model.JvmMetrics;
 import com.serverdoctor.model.ThreadAnalysis;
 import com.serverdoctor.report.HtmlReportGenerator;
@@ -98,15 +100,22 @@ public class ServerDoctorApplication {
                 new ArrayList<DiagnosticResult>(analyzer.analyzeSystem(cpu, memory, disks));
 
         JvmMetrics jvmMetrics = null;
+        JvmFlags jvmFlags = null;
         ThreadAnalysis threadAnalysis = null;
 
         if (target != null) {
             System.out.println();
             System.out.println("诊断目标：PID=" + target.getPid());
 
+            System.out.println();
+            System.out.println("正在采集JVM实际生效参数...");
+            jvmFlags = new JvmFlagsCollector().collect(target.getPid());
+            printJvmFlags(jvmFlags);
+            results.addAll(analyzer.analyzeJvmCommandLine(target, jvmFlags));
+
             jvmMetrics = new JvmMetricsCollector().collect(target.getPid());
-            printJvmMetrics(jvmMetrics);
-            results.addAll(analyzer.analyzeJvm(jvmMetrics));
+            printJvmMetrics(jvmMetrics, jvmFlags);
+            results.addAll(analyzer.analyzeJvm(jvmMetrics, jvmFlags));
 
             List<String> dumps = collectThreadDumps(
                     target,
@@ -130,6 +139,7 @@ public class ServerDoctorApplication {
                 disks,
                 target,
                 jvmMetrics,
+                jvmFlags,
                 threadAnalysis,
                 config.getIntervalSeconds()
         );
@@ -218,7 +228,7 @@ public class ServerDoctorApplication {
         if (javaProcesses.size() > 1) {
             System.out.println();
             System.out.println("检测到多个Java进程，为避免误诊断，不自动执行jstack。");
-            System.out.println("请使用：java -jar server-doctor-0.2.0.jar --pid <PID>");
+            System.out.println("请使用：java -jar server-doctor.jar --pid <PID>");
         }
 
         return null;
@@ -233,7 +243,22 @@ public class ServerDoctorApplication {
         System.out.println("Command: " + safe(process.getCommandLine()));
     }
 
-    private static void printJvmMetrics(JvmMetrics metrics) {
+    private static void printJvmFlags(JvmFlags flags) {
+        if (flags == null || !flags.isAvailable()) {
+            System.out.println("JVM实际参数不可用：" +
+                    (flags == null ? "无数据" : flags.getMessage()));
+            return;
+        }
+
+        System.out.printf("InitialHeapSize: %.2f MB%n",
+                flags.getInitialHeapSizeBytes() / 1024D / 1024D);
+        System.out.printf("MaxHeapSize: %.2f MB%n",
+                flags.getMaxHeapSizeBytes() / 1024D / 1024D);
+        System.out.println("GC: " + flags.getGarbageCollector());
+        System.out.println("JVM有效参数: " + safe(flags.getEffectiveJvmArgs()));
+    }
+
+    private static void printJvmMetrics(JvmMetrics metrics, JvmFlags flags) {
         System.out.println();
         System.out.println("正在采集JVM Heap / GC指标...");
 
@@ -244,11 +269,19 @@ public class ServerDoctorApplication {
         }
 
         System.out.printf(
-                "Heap: %.2f MB / %.2f MB (%.2f%%)%n",
+                "Heap当前使用: %.2f MB；当前区容量: %.2f MB%n",
                 metrics.getHeapUsedKb() / 1024D,
-                metrics.getHeapCapacityKb() / 1024D,
-                metrics.getHeapUsagePercent()
+                metrics.getHeapCapacityKb() / 1024D
         );
+
+        if (flags != null && flags.isAvailable() && flags.getMaxHeapSizeBytes() > 0) {
+            double actualUsage = metrics.getHeapUsedKb() * 1024D
+                    / flags.getMaxHeapSizeBytes() * 100D;
+
+            System.out.printf("Heap实际Max: %.2f MB；实际使用率: %.2f%%%n",
+                    flags.getMaxHeapSizeBytes() / 1024D / 1024D,
+                    actualUsage);
+        }
 
         System.out.println(
                 "Young GC: " + metrics.getYoungGcCount() +
@@ -274,7 +307,7 @@ public class ServerDoctorApplication {
             System.out.println("TIMED_WAITING：" + last.getStateCount("TIMED_WAITING"));
         }
 
-        System.out.println("持续RUNNABLE热点候选：" +
+        System.out.println("持续RUNNABLE计算候选：" +
                 analysis.getPersistentRunnableThreads().size());
 
         System.out.println("死锁：" +
@@ -306,17 +339,17 @@ public class ServerDoctorApplication {
 
     private static void printBanner() {
         System.out.println("================================");
-        System.out.println("       Server Doctor V0.2");
+        System.out.println("       Server Doctor V0.2.1");
         System.out.println("================================");
     }
 
     private static void printUsage() {
-        System.out.println("Server Doctor V0.2");
+        System.out.println("Server Doctor V0.2.1");
         System.out.println();
         System.out.println("用法：");
-        System.out.println("  java -jar server-doctor-0.2.0.jar --pid 1");
-        System.out.println("  java -jar server-doctor-0.2.0.jar --pid 1 --output /u01/soft/logs/moc-temp");
-        System.out.println("  java -jar server-doctor-0.2.0.jar --pid 1 --samples 3 --interval 5");
+        System.out.println("  java -jar server-doctor.jar --pid 1");
+        System.out.println("  java -jar server-doctor.jar --pid 1 --output /u01/soft/logs/moc-temp");
+        System.out.println("  java -jar server-doctor.jar --pid 1 --samples 3 --interval 5");
         System.out.println();
         System.out.println("参数：");
         System.out.println("  --pid       指定目标Java进程PID");
@@ -324,8 +357,5 @@ public class ServerDoctorApplication {
         System.out.println("  --samples   jstack采样次数，默认3，范围1-10");
         System.out.println("  --interval  jstack采样间隔秒数，默认5，范围1-60");
         System.out.println("  --help      显示帮助");
-        System.out.println();
-        System.out.println("输出：");
-        System.out.println("  每次诊断会在output目录下创建独立的server-doctor-时间-pid目录。");
     }
 }
