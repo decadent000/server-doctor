@@ -13,10 +13,23 @@ public class JavaProcessCollector {
     private final SystemInfo systemInfo = new SystemInfo();
 
     public List<JavaProcessInfo> findJavaProcesses() {
+        return findJavaProcesses(-1);
+    }
+
+    /**
+     * 查找当前系统中的Java进程。
+     *
+     * @param excludedPid 需要排除的PID；小于等于0表示不排除
+     */
+    public List<JavaProcessInfo> findJavaProcesses(int excludedPid) {
         List<JavaProcessInfo> result = new ArrayList<JavaProcessInfo>();
         OperatingSystem os = systemInfo.getOperatingSystem();
 
         for (OSProcess process : os.getProcesses()) {
+            if (excludedPid > 0 && process.getProcessID() == excludedPid) {
+                continue;
+            }
+
             String name = process.getName();
             String commandLine = process.getCommandLine();
 
