@@ -2,16 +2,20 @@ package com.serverdoctor;
 
 import com.serverdoctor.analyzer.DiagnosticAnalyzer;
 import com.serverdoctor.analyzer.ThreadDumpAnalyzer;
+import com.serverdoctor.collector.ContainerMetricsCollector;
 import com.serverdoctor.collector.JavaProcessCollector;
 import com.serverdoctor.collector.JvmFlagsCollector;
 import com.serverdoctor.collector.JvmMetricsCollector;
 import com.serverdoctor.collector.SystemCollector;
+import com.serverdoctor.collector.ThreadCpuCollector;
 import com.serverdoctor.collector.ThreadDumpCollector;
 import com.serverdoctor.config.RunConfig;
+import com.serverdoctor.model.ContainerMetrics;
 import com.serverdoctor.model.DiagnosticResult;
 import com.serverdoctor.model.JvmFlags;
 import com.serverdoctor.model.JvmMetrics;
 import com.serverdoctor.model.ThreadAnalysis;
+import com.serverdoctor.model.ThreadCpuAnalysis;
 import com.serverdoctor.report.HtmlReportGenerator;
 import com.serverdoctor.util.OutputDirectoryManager;
 
@@ -70,6 +74,11 @@ public class ServerDoctorApplication {
         }
 
         System.out.println();
+        System.out.println("正在采集Docker/cgroup资源边界...");
+        ContainerMetrics containerMetrics = new ContainerMetricsCollector().collect();
+        printContainerMetrics(containerMetrics);
+
+        System.out.println();
         System.out.println("正在查找Java进程...");
 
         JavaProcessCollector processCollector = new JavaProcessCollector();
@@ -98,10 +107,12 @@ public class ServerDoctorApplication {
         DiagnosticAnalyzer analyzer = new DiagnosticAnalyzer();
         List<DiagnosticResult> results =
                 new ArrayList<DiagnosticResult>(analyzer.analyzeSystem(cpu, memory, disks));
+        results.addAll(analyzer.analyzeContainer(containerMetrics));
 
         JvmMetrics jvmMetrics = null;
         JvmFlags jvmFlags = null;
         ThreadAnalysis threadAnalysis = null;
+        ThreadCpuAnalysis threadCpuAnalysis = null;
 
         if (target != null) {
             System.out.println();
@@ -126,8 +137,25 @@ public class ServerDoctorApplication {
 
             threadAnalysis = new ThreadDumpAnalyzer().analyze(dumps);
             results.addAll(analyzer.analyzeThreads(threadAnalysis));
-
             printThreadSummary(threadAnalysis);
+
+            String lastDump = dumps.isEmpty()
+                    ? ""
+                    : dumps.get(dumps.size() - 1);
+
+            System.out.println();
+            System.out.println("正在采集真实线程CPU，窗口=" +
+                    config.getCpuSampleMillis() + " ms...");
+
+            threadCpuAnalysis = new ThreadCpuCollector().collect(
+                    target.getPid(),
+                    config.getCpuSampleMillis(),
+                    lastDump
+            );
+
+            printThreadCpu(threadCpuAnalysis);
+            writeThreadCpuFile(runDir, threadCpuAnalysis);
+            results.addAll(analyzer.analyzeThreadCpu(threadCpuAnalysis));
         }
 
         HtmlReportGenerator generator = new HtmlReportGenerator();
@@ -137,10 +165,12 @@ public class ServerDoctorApplication {
                 cpu,
                 memory,
                 disks,
+                containerMetrics,
                 target,
                 jvmMetrics,
                 jvmFlags,
                 threadAnalysis,
+                threadCpuAnalysis,
                 config.getIntervalSeconds()
         );
 
@@ -185,6 +215,49 @@ public class ServerDoctorApplication {
         }
 
         return dumps;
+    }
+
+    private static void writeThreadCpuFile(
+            File runDir,
+            ThreadCpuAnalysis analysis) throws IOException {
+
+        if (analysis == null || !analysis.isAvailable()) {
+            return;
+        }
+
+        StringBuilder builder = new StringBuilder();
+        builder.append("sampleMillis=")
+                .append(analysis.getSampleMillis())
+                .append(System.lineSeparator());
+
+        builder.append("CLK_TCK=")
+                .append(analysis.getClockTicksPerSecond())
+                .append(System.lineSeparator())
+                .append(System.lineSeparator());
+
+        builder.append(String.format(
+                "%-8s %-10s %-10s %-32s %s%n",
+                "CPU%",
+                "TID",
+                "nid",
+                "JavaThread",
+                "TopFrame"
+        ));
+
+        for (ThreadCpuAnalysis.HotThread thread : analysis.getHotThreads()) {
+            builder.append(String.format(
+                    "%-8.2f %-10d %-10s %-32s %s%n",
+                    thread.getCpuPercent(),
+                    thread.getTid(),
+                    thread.getNidHex(),
+                    thread.isMappedToJavaThread()
+                            ? thread.getThreadName()
+                            : "(unmapped)",
+                    thread.getTopFrame()
+            ));
+        }
+
+        writeText(new File(runDir, "thread-cpu.txt"), builder.toString());
     }
 
     private static void writeText(File file, String text) throws IOException {
@@ -232,6 +305,54 @@ public class ServerDoctorApplication {
         }
 
         return null;
+    }
+
+    private static void printContainerMetrics(ContainerMetrics metrics) {
+        if (metrics == null || !metrics.isAvailable()) {
+            System.out.println("cgroup指标不可用：" +
+                    (metrics == null ? "无数据" : metrics.getMessage()));
+            return;
+        }
+
+        System.out.println("cgroup: " + metrics.getCgroupVersion());
+
+        if (metrics.getMemoryUsageBytes() >= 0) {
+            System.out.printf("Container Memory: %.2f MB",
+                    metrics.getMemoryUsageBytes() / 1024D / 1024D);
+
+            if (metrics.getMemoryLimitBytes() > 0) {
+                System.out.printf(" / %.2f MB (%.2f%%)",
+                        metrics.getMemoryLimitBytes() / 1024D / 1024D,
+                        metrics.getMemoryUsagePercent());
+            }
+
+            System.out.println();
+        }
+
+        if (metrics.getCpuQuotaCores() > 0) {
+            System.out.printf("CPU quota: %.2f cores%n", metrics.getCpuQuotaCores());
+        } else {
+            System.out.println("CPU quota: unlimited / unknown");
+        }
+
+        System.out.println("cpuset: " +
+                (metrics.getCpusetCpus() == null || metrics.getCpusetCpus().isEmpty()
+                        ? "unknown"
+                        : metrics.getCpusetCpus()));
+
+        if (metrics.getCpuPeriods() > 0 && metrics.getCpuThrottledPeriods() >= 0) {
+            System.out.printf("CPU throttling: %d/%d (%.2f%%)%n",
+                    metrics.getCpuThrottledPeriods(),
+                    metrics.getCpuPeriods(),
+                    metrics.getCpuThrottleRatioPercent());
+        }
+
+        if (metrics.getPidsCurrent() >= 0) {
+            System.out.println("PIDs: " + metrics.getPidsCurrent() + " / " +
+                    (metrics.getPidsMax() > 0
+                            ? metrics.getPidsMax()
+                            : "unlimited / unknown"));
+        }
     }
 
     private static void printJavaProcess(JavaProcessCollector.JavaProcessInfo process) {
@@ -296,7 +417,7 @@ public class ServerDoctorApplication {
 
     private static void printThreadSummary(ThreadAnalysis analysis) {
         System.out.println();
-        System.out.println("线程分析完成：");
+        System.out.println("jstack线程分析完成：");
 
         ThreadAnalysis.SampleSummary last = analysis.getLastSampleSummary();
         if (last != null) {
@@ -312,6 +433,33 @@ public class ServerDoctorApplication {
 
         System.out.println("死锁：" +
                 (analysis.isDeadlockDetected() ? "检测到" : "未发现"));
+    }
+
+    private static void printThreadCpu(ThreadCpuAnalysis analysis) {
+        if (analysis == null || !analysis.isAvailable()) {
+            System.out.println("线程CPU采样不可用：" +
+                    (analysis == null ? "无数据" : analysis.getMessage()));
+            return;
+        }
+
+        int limit = Math.min(5, analysis.getHotThreads().size());
+        System.out.println("真实线程CPU Top " + limit + "：");
+
+        for (int i = 0; i < limit; i++) {
+            ThreadCpuAnalysis.HotThread thread = analysis.getHotThreads().get(i);
+
+            System.out.printf(
+                    "#%d CPU %.2f%% TID=%d nid=%s %s %s%n",
+                    i + 1,
+                    thread.getCpuPercent(),
+                    thread.getTid(),
+                    thread.getNidHex(),
+                    thread.isMappedToJavaThread()
+                            ? thread.getThreadName()
+                            : "(未映射Java线程)",
+                    thread.getTopFrame()
+            );
+        }
     }
 
     private static int getCurrentPid() {
@@ -339,23 +487,24 @@ public class ServerDoctorApplication {
 
     private static void printBanner() {
         System.out.println("================================");
-        System.out.println("       Server Doctor V0.2.1");
+        System.out.println("       Server Doctor V0.3");
         System.out.println("================================");
     }
 
     private static void printUsage() {
-        System.out.println("Server Doctor V0.2.1");
+        System.out.println("Server Doctor V0.3");
         System.out.println();
         System.out.println("用法：");
         System.out.println("  java -jar server-doctor.jar --pid 1");
         System.out.println("  java -jar server-doctor.jar --pid 1 --output /u01/soft/logs/moc-temp");
-        System.out.println("  java -jar server-doctor.jar --pid 1 --samples 3 --interval 5");
+        System.out.println("  java -jar server-doctor.jar --pid 1 --samples 3 --interval 5 --cpu-sample-ms 1000");
         System.out.println();
         System.out.println("参数：");
-        System.out.println("  --pid       指定目标Java进程PID");
-        System.out.println("  --output    输出根目录；也可使用环境变量SERVER_DOCTOR_OUTPUT");
-        System.out.println("  --samples   jstack采样次数，默认3，范围1-10");
-        System.out.println("  --interval  jstack采样间隔秒数，默认5，范围1-60");
-        System.out.println("  --help      显示帮助");
+        System.out.println("  --pid            指定目标Java进程PID");
+        System.out.println("  --output         输出根目录；也可使用环境变量SERVER_DOCTOR_OUTPUT");
+        System.out.println("  --samples        jstack采样次数，默认3，范围1-10");
+        System.out.println("  --interval       jstack采样间隔秒数，默认5，范围1-60");
+        System.out.println("  --cpu-sample-ms  Linux线程CPU采样窗口，默认1000ms，范围200-10000");
+        System.out.println("  --help           显示帮助");
     }
 }

@@ -24,7 +24,7 @@ public class ThreadDumpAnalyzer {
 
         for (int i = 0; i < dumps.size(); i++) {
             String dump = dumps.get(i);
-            List<ThreadSnapshot> threads = parseThreads(dump);
+            List<ThreadSnapshot> threads = parseSnapshots(dump);
             samples.add(threads);
             summaries.add(buildSummary(i + 1, threads));
 
@@ -48,8 +48,12 @@ public class ThreadDumpAnalyzer {
         );
     }
 
-    private List<ThreadSnapshot> parseThreads(String dump) {
+    public List<ThreadSnapshot> parseSnapshots(String dump) {
         List<ThreadSnapshot> threads = new ArrayList<ThreadSnapshot>();
+
+        if (dump == null || dump.isEmpty()) {
+            return threads;
+        }
 
         String currentName = null;
         String currentNid = null;

@@ -4,20 +4,71 @@
 
 ## 当前版本
 
-**V0.2.1 / JDK 8+**
+**V0.3.0 / JDK 8+**
 
-本版本根据真实生产报告修正诊断准确性：
+V0.3 的目标是把“jstack里看起来可疑”升级成“真实CPU线程 + Java调用栈”，并补充 Docker/cgroup 资源边界。
 
-- 固定输出包名为 `target/server-doctor.jar`
-- 通过 `jcmd VM.flags` 获取实际 InitialHeapSize / MaxHeapSize / GC
-- 通过 `jcmd VM.command_line` 获取 JVM 真正识别的有效参数
-- 自动识别 jar 后面的 `-Xms/-Xmx/-XX/-D/-agentlib/-javaagent` 等疑似失效 JVM 参数
-- Heap 使用率优先按实际 MaxHeapSize 计算
-- Metaspace 改为显示 Used / 当前 Capacity，不再把 Capacity 当最大值
-- 过滤 `ServerSocketChannelImpl.accept0` 等常见 native IO 等待，避免误报持续热点
-- 相同调用栈增加 `IO_WAIT / WAITING / COMPUTE_CANDIDATE` 分类
-- 线程总数 >= 1000 时给出关注提示
-- 明确说明 RUNNABLE 不等于 CPU 繁忙
+## V0.3 新增
+
+### 1. Docker / cgroup 指标
+
+兼容 cgroup v1 / v2，尽可能采集：
+
+- 容器 Memory usage / limit
+- CPU quota
+- cpuset
+- CPU throttling：nr_periods / nr_throttled / throttled time
+- pids.current / pids.max
+- cgroup v2 memory.events：oom / oom_kill
+- cgroup v1 memory.failcnt
+
+这样可以区分：
+
+```text
+宿主机资源看起来正常
+        ≠
+容器没有被CPU quota / memory limit限制
+```
+
+### 2. 真实线程 CPU 与 jstack 自动关联
+
+Linux 下通过：
+
+```text
+/proc/<pid>/task/<tid>/stat
+```
+
+短周期采样每个 native thread 的 utime + stime。
+
+然后：
+
+```text
+Linux TID（十进制）
+      ↓
+转换成 nid（十六进制）
+      ↓
+匹配 jstack nid=0x...
+      ↓
+Java线程名
+      ↓
+Java调用栈
+```
+
+最终报告可以直接出现：
+
+```text
+CPU 86.00%
+TID 558
+nid 0x22e
+pcb-process-14
+
+AStarOhtc.findPath(...)
+ -> getTimeOptimizedPath(...)
+ -> GetQFPathPCB(...)
+ -> CalcPath(...)
+```
+
+这比仅根据 RUNNABLE 判断热点可靠得多。
 
 ## 编译
 
@@ -40,92 +91,86 @@ java -Xms32m -Xmx128m \
   --output /u01/soft/logs/moc-temp
 ```
 
-默认采集 3 次 jstack，间隔 5 秒。
-
-## 报告重点
-
-### JVM实际生效配置
-
-V0.2.1 会区分：
+默认：
 
 ```text
-命令字符串里写了什么
-        ↓
-JVM实际上识别了什么
-        ↓
-VM.flags最终实际值是什么
+jstack采样次数：3
+jstack间隔：5秒
+真实线程CPU采样窗口：1000ms
 ```
 
-例如如果启动命令是：
+也可以：
 
 ```bash
-java -jar app.jar -Xmx550m
+java -Xms32m -Xmx128m \
+  -jar /u01/soft/logs/moc-temp/server-doctor.jar \
+  --pid 1 \
+  --output /u01/soft/logs/moc-temp \
+  --samples 3 \
+  --interval 5 \
+  --cpu-sample-ms 2000
 ```
 
-工具会提示 `-Xmx550m` 位于 jar 后面，通常不会作为 JVM 参数生效，并展示实际 `MaxHeapSize`。
+## 输出
 
-### 线程分类
+每次创建独立目录：
 
-jstack 中的 RUNNABLE 不等于正在消耗 CPU。
+```text
+server-doctor-时间-pid1/
+├── jstack-1.txt
+├── jstack-2.txt
+├── jstack-3.txt
+├── jstack.txt
+├── thread-cpu.txt
+└── server-doctor-report.html
+```
 
-V0.2.1 会把相同栈大致分成：
+## 如何理解线程CPU%
 
-- `IO_WAIT`：socket read、epoll、accept 等 native IO 等待
-- `WAITING`：park、wait、sleep 等
-- `COMPUTE_CANDIDATE`：未命中常见等待规则的 RUNNABLE
-- `OTHER`
+线程CPU来自两个采样点之间的CPU time增量：
 
-持续 RUNNABLE 候选也会过滤常见 IO 等待栈。
+```text
+(utime增量 + stime增量)
+-----------------------
+CLK_TCK × 实际采样秒数
+```
 
-## 下一阶段建议顺序
+显示的 100% 大致表示该线程在一个逻辑CPU上持续运行整个采样窗口。
 
-### V0.3：Docker/cgroup + 真实线程CPU关联
+这和 jstack 的 RUNNABLE 不一样：
 
-优先级最高：
+- RUNNABLE 可能实际在 socket read / epoll / accept 等native IO等待。
+- thread CPU% 是实际CPU时间增量。
+- V0.3 会把 thread CPU 的 Linux TID 与 jstack nid 自动关联。
 
-- 容器 CPU 使用率
-- 容器 Memory usage / limit
-- CPU quota / cpuset
-- CPU throttling
-- OOM / memory.events
-- PIDs 数量与限制
-- 容器与宿主机指标区分
-- 对目标 JVM 线程进行短周期 CPU 采样
-- 把 Linux TID 与 jstack `nid=0x...` 自动关联
-- 报告真正的高CPU线程及其Java调用栈
+## V0.2.1能力继续保留
 
-这是当前定位 A* CPU 99% 最关键的一步。
+- 实际 InitialHeapSize / MaxHeapSize
+- 实际GC类型
+- JVM有效参数
+- 自动发现 jar 后面的疑似失效 JVM 参数
+- Heap实际Max使用率
+- Metaspace Used / 当前Capacity
+- RUNNABLE IO等待过滤
+- 相同调用栈分类
+- 线程总数关注
+- 死锁检测
 
-### V0.4：GC趋势分析
+## 当前限制
 
-- 连续采集 jstat 增量，而不是只看进程启动以来累计值
-- Young GC / Full GC 每分钟增量
-- GC时间占比
-- Heap used变化趋势
-- Old区增长趋势
-- 可选读取 GC log 做停顿时间分布
+- 真实线程CPU功能依赖 Linux `/proc`。
+- `getconf CLK_TCK` 不可用时暂按100回退。
+- cgroup数据在不同Docker/Kubernetes和Linux发行版上可能有路径差异；当前已兼容常见cgroup v1/v2布局。
+- CPU throttling / OOM事件当前主要是累计值，不代表本次1秒采样窗口内刚发生。
+- Linux线程可能在CPU采样后退出，因此少数TID可能无法和最后一次jstack匹配。
+- 当前没有使用async-profiler，因此这是低侵入短周期采样，不是完整CPU火焰图。
 
-### V0.5：Redis诊断
+## 下一步
 
-采用可选配置，不把账号密码写入报告：
+V0.3经过生产环境验证后，再进入 V0.4：
 
-- PING与连接延迟
-- connected_clients / maxclients
-- blocked_clients
-- used_memory / maxmemory
-- evicted_keys
-- rejected_connections
-- instantaneous_ops_per_sec
-- slowlog
-- Cluster状态、slot与节点健康
-- 连接数异常增长提示
-
-### 后续
-
-1. 日志异常聚类
-2. MySQL / Oracle 诊断
-3. Heap Dump 辅助分析（仅手工触发）
-4. AI 辅助根因分析
-5. Web / Agent 模式
-
-AI 和 Web/Agent 放后面，先保证底层采集数据可靠，否则只会把不准确的数据包装得更漂亮。
+- jstat连续采样
+- Heap / Old区趋势
+- Young GC / Full GC增量
+- GC耗时占比
+- GC日志趋势分析

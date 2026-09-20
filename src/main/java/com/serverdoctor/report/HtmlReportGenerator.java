@@ -2,10 +2,12 @@ package com.serverdoctor.report;
 
 import com.serverdoctor.collector.JavaProcessCollector;
 import com.serverdoctor.collector.SystemCollector;
+import com.serverdoctor.model.ContainerMetrics;
 import com.serverdoctor.model.DiagnosticResult;
 import com.serverdoctor.model.JvmFlags;
 import com.serverdoctor.model.JvmMetrics;
 import com.serverdoctor.model.ThreadAnalysis;
+import com.serverdoctor.model.ThreadCpuAnalysis;
 
 import java.io.File;
 import java.io.FileWriter;
@@ -21,10 +23,12 @@ public class HtmlReportGenerator {
                          double cpu,
                          double memory,
                          List<SystemCollector.DiskInfo> disks,
+                         ContainerMetrics containerMetrics,
                          JavaProcessCollector.JavaProcessInfo target,
                          JvmMetrics jvmMetrics,
                          JvmFlags jvmFlags,
                          ThreadAnalysis threadAnalysis,
+                         ThreadCpuAnalysis threadCpuAnalysis,
                          int intervalSeconds) throws IOException {
 
         File file = new File(outputDir, "server-doctor-report.html");
@@ -34,7 +38,7 @@ public class HtmlReportGenerator {
             writer.write("<!DOCTYPE html>");
             writer.write("<html><head><meta charset='UTF-8'>");
             writer.write("<meta name='viewport' content='width=device-width, initial-scale=1'>");
-            writer.write("<title>Server Doctor V0.2.1</title>");
+            writer.write("<title>Server Doctor V0.3</title>");
             writer.write("<style>");
             writer.write("body{font-family:Arial,'Microsoft YaHei',sans-serif;margin:36px;background:#f5f5f5;color:#222;}");
             writer.write(".card{background:#fff;padding:20px;margin:16px 0;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.08);}");
@@ -44,16 +48,18 @@ public class HtmlReportGenerator {
             writer.write(".muted{color:#666}.metric{font-size:24px;font-weight:bold;}.tag{padding:2px 6px;border-radius:4px;background:#eee;font-size:12px;}");
             writer.write("</style></head><body>");
 
-            writer.write("<h1>Server Doctor V0.2.1 诊断报告</h1>");
+            writer.write("<h1>Server Doctor V0.3 诊断报告</h1>");
             writer.write("<p class='muted'>生成时间：" +
                     escape(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())) + "</p>");
 
             writeSummary(writer, results, target);
             writeSystem(writer, cpu, memory, disks);
+            writeContainer(writer, containerMetrics);
             writeJvm(writer, jvmMetrics, jvmFlags);
+            writeThreadCpu(writer, threadCpuAnalysis);
             writeThreadAnalysis(writer, threadAnalysis, intervalSeconds);
             writeDiagnostics(writer, results);
-            writeArtifacts(writer, threadAnalysis);
+            writeArtifacts(writer, threadAnalysis, threadCpuAnalysis);
 
             writer.write("</body></html>");
         } finally {
@@ -98,6 +104,59 @@ public class HtmlReportGenerator {
         }
 
         writer.write("</table></div>");
+    }
+
+    private void writeContainer(FileWriter writer,
+                                ContainerMetrics metrics) throws IOException {
+
+        writer.write("<div class='card'><h2>Docker / cgroup资源边界</h2>");
+
+        if (metrics == null || !metrics.isAvailable()) {
+            writer.write("<p class='WARN'>无法采集cgroup指标：" +
+                    escape(metrics == null ? "无数据" : metrics.getMessage()) + "</p></div>");
+            return;
+        }
+
+        writer.write("<p>cgroup：" + escape(metrics.getCgroupVersion()) +
+                " <span class='muted'>" + escape(metrics.getMessage()) + "</span></p>");
+        writer.write("<table><tr><th>指标</th><th>值</th></tr>");
+
+        writer.write("<tr><td>Memory</td><td>" +
+                formatBytes(metrics.getMemoryUsageBytes()) + " / " +
+                formatLimitBytes(metrics.getMemoryLimitBytes()) +
+                formatPercent(metrics.getMemoryUsagePercent()) + "</td></tr>");
+
+        writer.write("<tr><td>CPU quota</td><td>" +
+                (metrics.getCpuQuotaCores() > 0
+                        ? format(metrics.getCpuQuotaCores()) + " cores"
+                        : "unlimited / unknown") + "</td></tr>");
+
+        writer.write("<tr><td>cpuset</td><td>" +
+                escape(emptyAsUnknown(metrics.getCpusetCpus())) + "</td></tr>");
+
+        writer.write("<tr><td>CPU throttling</td><td>nr_throttled=" +
+                metrics.getCpuThrottledPeriods() +
+                " / nr_periods=" + metrics.getCpuPeriods() +
+                formatPercent(metrics.getCpuThrottleRatioPercent()) +
+                "，累计throttled=" +
+                (metrics.getCpuThrottledTimeMillis() >= 0
+                        ? format(metrics.getCpuThrottledTimeMillis()) + " ms"
+                        : "unknown") + "</td></tr>");
+
+        writer.write("<tr><td>PIDs</td><td>" +
+                valueOrUnknown(metrics.getPidsCurrent()) + " / " +
+                limitOrUnlimited(metrics.getPidsMax()) +
+                formatPercent(metrics.getPidsUsagePercent()) + "</td></tr>");
+
+        writer.write("<tr><td>OOM</td><td>oom=" +
+                valueOrUnknown(metrics.getOomCount()) +
+                "，oom_kill=" + valueOrUnknown(metrics.getOomKillCount()) +
+                "，memory.failcnt=" + valueOrUnknown(metrics.getMemoryFailCount()) +
+                "</td></tr>");
+
+        writer.write("</table>");
+        writer.write("<p class='muted'>cgroup throttling与OOM类指标通常是累计值；单次报告用于判断资源边界，趋势判断需后续版本连续采样。</p>");
+        writer.write("</div>");
     }
 
     private void writeJvm(FileWriter writer,
@@ -161,11 +220,61 @@ public class HtmlReportGenerator {
         writer.write("</div>");
     }
 
+    private void writeThreadCpu(FileWriter writer,
+                                ThreadCpuAnalysis analysis) throws IOException {
+
+        writer.write("<div class='card'><h2>真实线程CPU采样</h2>");
+
+        if (analysis == null || !analysis.isAvailable()) {
+            writer.write("<p class='WARN'>线程CPU采样不可用：" +
+                    escape(analysis == null ? "无数据" : analysis.getMessage()) + "</p></div>");
+            return;
+        }
+
+        writer.write("<p>采样窗口：" + analysis.getSampleMillis() +
+                " ms；CLK_TCK=" + analysis.getClockTicksPerSecond() + "。</p>");
+        writer.write("<p class='muted'>CPU%按单个逻辑CPU的时间尺度计算；Linux TID会转换为十六进制并与jstack nid匹配。</p>");
+
+        writer.write("<table><tr><th>排名</th><th>CPU%</th><th>TID</th><th>nid</th><th>Java线程</th><th>状态</th><th>顶部调用</th></tr>");
+
+        int limit = Math.min(10, analysis.getHotThreads().size());
+        for (int i = 0; i < limit; i++) {
+            ThreadCpuAnalysis.HotThread thread = analysis.getHotThreads().get(i);
+            writer.write("<tr><td>" + (i + 1) + "</td><td><b>" +
+                    format(thread.getCpuPercent()) + "%</b></td><td>" +
+                    thread.getTid() + "</td><td>" +
+                    escape(thread.getNidHex()) + "</td><td>" +
+                    escape(thread.isMappedToJavaThread()
+                            ? thread.getThreadName()
+                            : "(未映射)") + "</td><td>" +
+                    escape(thread.getState()) + "</td><td><code>" +
+                    escape(thread.getTopFrame()) + "</code></td></tr>");
+        }
+
+        writer.write("</table>");
+
+        int stackLimit = Math.min(5, analysis.getHotThreads().size());
+        for (int i = 0; i < stackLimit; i++) {
+            ThreadCpuAnalysis.HotThread thread = analysis.getHotThreads().get(i);
+
+            if (!thread.isMappedToJavaThread() || thread.getStack().isEmpty()) {
+                continue;
+            }
+
+            writer.write("<h4>#" + (i + 1) + " " +
+                    escape(thread.getThreadName()) + " - " +
+                    format(thread.getCpuPercent()) + "%</h4>");
+            writer.write("<pre>" + escape(join(thread.getStack())) + "</pre>");
+        }
+
+        writer.write("</div>");
+    }
+
     private void writeThreadAnalysis(FileWriter writer,
                                      ThreadAnalysis analysis,
                                      int intervalSeconds) throws IOException {
 
-        writer.write("<div class='card'><h2>线程分析</h2>");
+        writer.write("<div class='card'><h2>jstack线程分析</h2>");
 
         if (analysis == null) {
             writer.write("<p>未进行线程分析。</p></div>");
@@ -174,7 +283,7 @@ public class HtmlReportGenerator {
 
         writer.write("<p>采样次数：" + analysis.getSampleCount() +
                 "，采样间隔：" + intervalSeconds + " 秒。</p>");
-        writer.write("<p class='muted'>注意：JVM里的RUNNABLE包含native socket/epoll/accept等IO等待，因此不能把RUNNABLE数量直接等同于CPU繁忙线程。</p>");
+        writer.write("<p class='muted'>jstack里的RUNNABLE包含native socket/epoll/accept等IO等待；判断CPU热点优先参考上面的真实线程CPU采样。</p>");
 
         if (analysis.isDeadlockDetected()) {
             writer.write("<p class='HIGH'><b>检测到Java级死锁</b>，出现于样本：" +
@@ -260,10 +369,15 @@ public class HtmlReportGenerator {
     }
 
     private void writeArtifacts(FileWriter writer,
-                                ThreadAnalysis analysis) throws IOException {
+                                ThreadAnalysis analysis,
+                                ThreadCpuAnalysis threadCpuAnalysis) throws IOException {
 
         writer.write("<div class='card'><h2>本次生成文件</h2>");
         writer.write("<ul><li>server-doctor-report.html</li>");
+
+        if (threadCpuAnalysis != null && threadCpuAnalysis.isAvailable()) {
+            writer.write("<li>thread-cpu.txt</li>");
+        }
 
         if (analysis != null) {
             writer.write("<li>jstack.txt（最后一次采样，兼容旧用法）</li>");
@@ -281,6 +395,33 @@ public class HtmlReportGenerator {
             builder.append(line).append('\n');
         }
         return builder.toString();
+    }
+
+    private String formatBytes(long bytes) {
+        if (bytes < 0) {
+            return "unknown";
+        }
+        return format(bytes / 1024D / 1024D) + " MB";
+    }
+
+    private String formatLimitBytes(long bytes) {
+        return bytes <= 0 ? "unlimited / unknown" : formatBytes(bytes);
+    }
+
+    private String formatPercent(double value) {
+        return value < 0 ? "" : " (" + format(value) + "%)";
+    }
+
+    private String valueOrUnknown(long value) {
+        return value < 0 ? "unknown" : String.valueOf(value);
+    }
+
+    private String limitOrUnlimited(long value) {
+        return value <= 0 ? "unlimited / unknown" : String.valueOf(value);
+    }
+
+    private String emptyAsUnknown(String value) {
+        return value == null || value.trim().isEmpty() ? "unknown" : value;
     }
 
     private double toGb(long bytes) {

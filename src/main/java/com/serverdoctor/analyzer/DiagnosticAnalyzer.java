@@ -2,10 +2,12 @@ package com.serverdoctor.analyzer;
 
 import com.serverdoctor.collector.JavaProcessCollector;
 import com.serverdoctor.collector.SystemCollector;
+import com.serverdoctor.model.ContainerMetrics;
 import com.serverdoctor.model.DiagnosticResult;
 import com.serverdoctor.model.JvmFlags;
 import com.serverdoctor.model.JvmMetrics;
 import com.serverdoctor.model.ThreadAnalysis;
+import com.serverdoctor.model.ThreadCpuAnalysis;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -22,6 +24,138 @@ public class DiagnosticAnalyzer {
         analyzeCpu(cpu, results);
         analyzeMemory(memory, results);
         analyzeDisks(disks, results);
+
+        return results;
+    }
+
+    public List<DiagnosticResult> analyzeContainer(ContainerMetrics metrics) {
+        List<DiagnosticResult> results = new ArrayList<DiagnosticResult>();
+
+        if (metrics == null || !metrics.isAvailable()) {
+            return results;
+        }
+
+        double memoryUsage = metrics.getMemoryUsagePercent();
+        if (memoryUsage >= 95D) {
+            results.add(new DiagnosticResult(
+                    "HIGH",
+                    "CGROUP",
+                    "容器内存接近限制",
+                    String.format("容器Memory使用率 %.2f%%", memoryUsage),
+                    "建议确认memory limit是否合理，并检查JVM Heap、Direct Memory、线程栈和其他native内存。"
+            ));
+        } else if (memoryUsage >= 85D) {
+            results.add(new DiagnosticResult(
+                    "WARN",
+                    "CGROUP",
+                    "容器内存使用率偏高",
+                    String.format("容器Memory使用率 %.2f%%", memoryUsage),
+                    "建议持续观察容器内存趋势，避免触发OOM Kill。"
+            ));
+        }
+
+        double throttleRatio = metrics.getCpuThrottleRatioPercent();
+        if (throttleRatio >= 50D) {
+            results.add(new DiagnosticResult(
+                    "HIGH",
+                    "CGROUP",
+                    "容器CPU累计节流比例很高",
+                    String.format("nr_throttled / nr_periods = %.2f%%", throttleRatio),
+                    "该指标为累计值。建议检查CPU quota是否过低，并结合当前CPU负载判断是否长期受限。"
+            ));
+        } else if (throttleRatio >= 20D) {
+            results.add(new DiagnosticResult(
+                    "WARN",
+                    "CGROUP",
+                    "容器存在较多CPU节流",
+                    String.format("nr_throttled / nr_periods = %.2f%%", throttleRatio),
+                    "该指标为累计值。建议检查CPU quota与业务峰值CPU需求。"
+            ));
+        }
+
+        double pidsUsage = metrics.getPidsUsagePercent();
+        if (pidsUsage >= 90D) {
+            results.add(new DiagnosticResult(
+                    "HIGH",
+                    "CGROUP",
+                    "容器PID数量接近限制",
+                    String.format("pids使用率 %.2f%%", pidsUsage),
+                    "线程也会占用PID配额。建议检查线程总数和pids.max。"
+            ));
+        } else if (pidsUsage >= 75D) {
+            results.add(new DiagnosticResult(
+                    "WARN",
+                    "CGROUP",
+                    "容器PID数量偏高",
+                    String.format("pids使用率 %.2f%%", pidsUsage),
+                    "建议检查Java线程数、子进程数量与pids.max配置。"
+            ));
+        }
+
+        if (metrics.getOomKillCount() > 0) {
+            results.add(new DiagnosticResult(
+                    "HIGH",
+                    "CGROUP",
+                    "容器发生过OOM Kill",
+                    "memory.events oom_kill=" + metrics.getOomKillCount(),
+                    "建议检查容器memory limit、JVM MaxHeap、Direct Memory与历史内存峰值。"
+            ));
+        } else if (metrics.getOomCount() > 0) {
+            results.add(new DiagnosticResult(
+                    "WARN",
+                    "CGROUP",
+                    "容器发生过OOM事件",
+                    "memory.events oom=" + metrics.getOomCount(),
+                    "建议检查容器内存限制和历史内存压力。"
+            ));
+        }
+
+        if (metrics.getMemoryFailCount() > 0) {
+            results.add(new DiagnosticResult(
+                    "WARN",
+                    "CGROUP",
+                    "cgroup v1内存限制触发过失败计数",
+                    "memory.failcnt=" + metrics.getMemoryFailCount(),
+                    "建议核对容器内存限制及历史峰值。"
+            ));
+        }
+
+        return results;
+    }
+
+    public List<DiagnosticResult> analyzeThreadCpu(ThreadCpuAnalysis analysis) {
+        List<DiagnosticResult> results = new ArrayList<DiagnosticResult>();
+
+        if (analysis == null || !analysis.isAvailable()) {
+            return results;
+        }
+
+        ThreadCpuAnalysis.HotThread hottest = analysis.getHottestThread();
+        if (hottest == null) {
+            return results;
+        }
+
+        String identity = hottest.isMappedToJavaThread()
+                ? hottest.getThreadName() + " -> " + hottest.getTopFrame()
+                : "TID=" + hottest.getTid();
+
+        if (hottest.getCpuPercent() >= 80D) {
+            results.add(new DiagnosticResult(
+                    "HIGH",
+                    "THREAD_CPU",
+                    "发现单线程高CPU",
+                    String.format("%s，短周期CPU %.2f%%", identity, hottest.getCpuPercent()),
+                    "已通过Linux TID与jstack nid关联。建议优先检查该线程调用栈和对应业务循环/计算逻辑。"
+            ));
+        } else if (hottest.getCpuPercent() >= 50D) {
+            results.add(new DiagnosticResult(
+                    "WARN",
+                    "THREAD_CPU",
+                    "发现较高CPU线程",
+                    String.format("%s，短周期CPU %.2f%%", identity, hottest.getCpuPercent()),
+                    "该值来自短周期/proc采样，建议在问题持续时重复执行以确认稳定性。"
+            ));
+        }
 
         return results;
     }
@@ -143,7 +277,7 @@ public class DiagnosticAnalyzer {
                     "THREAD",
                     "发现持续RUNNABLE计算候选",
                     detail.toString(),
-                    "已过滤常见park/socket/epoll/accept等等待栈；仍建议结合真实线程CPU采样确认。"
+                    "已过滤常见park/socket/epoll/accept等等待栈；优先以V0.3的真实线程CPU采样结果为准。"
             ));
         }
 
@@ -235,7 +369,7 @@ public class DiagnosticAnalyzer {
                     "CPU",
                     "CPU使用率严重过高",
                     String.format("当前CPU使用率 %.2f%%", cpu),
-                    "建议立即检查Java热点线程、死循环、频繁GC以及高计算量任务。"
+                    "建议优先查看V0.3真实线程CPU采样及对应Java调用栈。"
             ));
         } else if (cpu >= 70D) {
             results.add(new DiagnosticResult(
@@ -243,7 +377,7 @@ public class DiagnosticAnalyzer {
                     "CPU",
                     "CPU使用率偏高",
                     String.format("当前CPU使用率 %.2f%%", cpu),
-                    "建议持续观察CPU趋势并检查Java进程CPU占用。"
+                    "建议持续观察CPU趋势并检查真实线程CPU采样。"
             ));
         }
     }

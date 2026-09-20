@@ -6,6 +6,7 @@ public final class RunConfig {
     private String outputRoot;
     private int samples = 3;
     private int intervalSeconds = 5;
+    private int cpuSampleMillis = 1000;
     private boolean help;
 
     private RunConfig() {
@@ -42,6 +43,16 @@ public final class RunConfig {
                 config.intervalSeconds = parsePositiveInt(args[i], "interval", 1, 60);
             } else if (arg.startsWith("--interval=")) {
                 config.intervalSeconds = parsePositiveInt(arg.substring("--interval=".length()), "interval", 1, 60);
+            } else if ("--cpu-sample-ms".equals(arg)) {
+                i = requireNext(args, i, "--cpu-sample-ms");
+                config.cpuSampleMillis = parsePositiveInt(args[i], "cpu-sample-ms", 200, 10000);
+            } else if (arg.startsWith("--cpu-sample-ms=")) {
+                config.cpuSampleMillis = parsePositiveInt(
+                        arg.substring("--cpu-sample-ms=".length()),
+                        "cpu-sample-ms",
+                        200,
+                        10000
+                );
             } else {
                 throw new IllegalArgumentException("未知参数：" + arg);
             }
@@ -100,6 +111,10 @@ public final class RunConfig {
 
     public int getIntervalSeconds() {
         return intervalSeconds;
+    }
+
+    public int getCpuSampleMillis() {
+        return cpuSampleMillis;
     }
 
     public boolean isHelp() {
