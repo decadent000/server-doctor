@@ -60,12 +60,12 @@ Java调用栈
 CPU 86.00%
 TID 558
 nid 0x22e
-pcb-process-14
+example-worker-14
 
-AStarOhtc.findPath(...)
- -> getTimeOptimizedPath(...)
- -> GetQFPathPCB(...)
- -> CalcPath(...)
+ExampleTaskProcessor.process(...)
+ -> prepareWork(...)
+ -> executeWork(...)
+ -> handleRequest(...)
 ```
 
 这比仅根据 RUNNABLE 判断热点可靠得多。
@@ -86,9 +86,9 @@ target/server-doctor.jar
 
 ```bash
 java -Xms32m -Xmx128m \
-  -jar /u01/soft/logs/moc-temp/server-doctor.jar \
+  -jar /path/to/server-doctor.jar \
   --pid 1 \
-  --output /u01/soft/logs/moc-temp
+  --output ./doctor-reports
 ```
 
 默认：
@@ -103,9 +103,9 @@ jstack间隔：5秒
 
 ```bash
 java -Xms32m -Xmx128m \
-  -jar /u01/soft/logs/moc-temp/server-doctor.jar \
+  -jar /path/to/server-doctor.jar \
   --pid 1 \
-  --output /u01/soft/logs/moc-temp \
+  --output ./doctor-reports \
   --samples 3 \
   --interval 5 \
   --cpu-sample-ms 2000
